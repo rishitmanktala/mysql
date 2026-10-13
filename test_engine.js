@@ -343,7 +343,7 @@ class SQLEngine {
     if (firstUpper === "USE") return this.handleUse(tokens);
     if (firstUpper === "CREATE") return this.handleCreate(tokens);
     if (firstUpper === "DROP") return this.handleDrop(tokens);
-    if (firstUpper === "DESC" || firstUpper === "DESCRIBE") return this.handleDescribe(tokens);
+    if (firstUpper === "DESC" || firstUpper === "DESCRIBE" || firstUpper === "EXPLAIN") return this.handleDescribe(tokens);
     if (firstUpper === "ALTER") return this.handleAlter(tokens);
     if (firstUpper === "INSERT") return this.handleInsert(tokens);
     if (firstUpper === "UPDATE") return this.handleUpdate(tokens);
@@ -368,11 +368,19 @@ class SQLEngine {
       };
     }
     if (secondUpper === "TABLES") {
-      if (!this.activeDb || !this.databases[this.activeDb]) {
+      let targetDb = this.activeDb;
+      if (tokens.length >= 4 && (tokIs(tokens[2], "FROM") || tokIs(tokens[2], "IN"))) {
+        targetDb = tokens[3].value;
+      }
+      if (!targetDb) {
         throw new Error("ERROR 1046 (3D000): No database selected");
       }
-      const colName = `Tables_in_${this.activeDb}`;
-      const tbls = Object.keys(this.databases[this.activeDb].tables).sort();
+      const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDb.toLowerCase());
+      if (!dbMatch) {
+        throw new Error(`ERROR 1049 (42000): Unknown database '${targetDb}'`);
+      }
+      const colName = `Tables_in_${dbMatch}`;
+      const tbls = Object.keys(this.databases[dbMatch].tables).sort();
       return {
         type: "TABLE",
         columns: [colName],
@@ -425,15 +433,23 @@ class SQLEngine {
     }
 
     if (kind === "TABLE") {
-      if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
       let ifNotExists = false;
       if (tokIs(tokens[idx], "IF") && tokIs(tokens[idx + 1], "NOT") && tokIs(tokens[idx + 2], "EXISTS")) {
         ifNotExists = true;
         idx += 3;
       }
       if (!tokens[idx]) throw new Error("ERROR 1064 (42000): Missing table name");
-      const tableName = tokens[idx++].value;
-      const db = this.databases[this.activeDb];
+      let targetDbName = this.activeDb;
+      let tableName = tokens[idx++].value;
+      if (idx < tokens.length && tokens[idx].value === ".") {
+        idx++;
+        targetDbName = tableName;
+        tableName = tokens[idx++].value;
+      }
+      if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+      const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+      if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+      const db = this.databases[dbMatch];
       const existing = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
       if (existing) {
         if (ifNotExists) {
@@ -575,19 +591,31 @@ class SQLEngine {
     }
 
     if (kind === "TABLE") {
-      if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
       let ifExists = false;
       if (tokIs(tokens[idx], "IF") && tokIs(tokens[idx + 1], "EXISTS")) {
         ifExists = true;
         idx += 2;
       }
       if (!tokens[idx]) throw new Error("ERROR 1064 (42000): Missing table name");
-      const tableName = tokens[idx].value;
-      const db = this.databases[this.activeDb];
+      let targetDbName = this.activeDb;
+      let tableName = tokens[idx].value;
+      if (idx + 2 < tokens.length && tokens[idx + 1].value === ".") {
+        targetDbName = tokens[idx].value;
+        tableName = tokens[idx + 2].value;
+        idx += 2;
+      }
+      idx++;
+      if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+      const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+      if (!dbMatch) {
+        if (ifExists) return { type: "MESSAGE", message: "Query OK, 0 rows affected, 1 warning (0.00 sec)" };
+        throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+      }
+      const db = this.databases[dbMatch];
       const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
       if (!match) {
         if (ifExists) return { type: "MESSAGE", message: "Query OK, 0 rows affected, 1 warning (0.00 sec)" };
-        throw new Error(`ERROR 1051 (42S02): Unknown table '${this.activeDb}.${tableName}'`);
+        throw new Error(`ERROR 1051 (42S02): Unknown table '${dbMatch}.${tableName}'`);
       }
       delete db.tables[match];
       return { type: "MESSAGE", message: "Query OK, 0 rows affected (0.01 sec)" };
@@ -597,20 +625,27 @@ class SQLEngine {
   }
 
   handleDescribe(tokens) {
-    if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
     if (tokens.length < 2) throw new Error("ERROR 1064 (42000): Missing table name in DESCRIBE");
-    const tableName = tokens[1].value;
-    const db = this.databases[this.activeDb];
+    let targetDbName = this.activeDb;
+    let tableName = tokens[1].value;
+    if (tokens.length >= 4 && tokens[2].value === ".") {
+      targetDbName = tokens[1].value;
+      tableName = tokens[3].value;
+    }
+    if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+    const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+    if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+    const db = this.databases[dbMatch];
     const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
-    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tableName}' doesn't exist`);
+    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tableName}' doesn't exist`);
     const table = db.tables[match];
     const rows = table.columns.map(col => ({
       Field: col.name,
       Type: col.type.toLowerCase(),
       Null: col.notNull ? "NO" : "YES",
       Key: col.isPrimary ? "PRI" : "",
-      Default: col.default !== null ? String(col.default) : "NULL",
-      Extra: ""
+      Default: col.default !== null && col.default !== undefined ? String(col.default) : "NULL",
+      Extra: col.extra || ""
     }));
 
     return {
@@ -621,17 +656,25 @@ class SQLEngine {
   }
 
   handleAlter(tokens) {
-    if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
     if (tokens.length < 4 || !tokIs(tokens[1], "TABLE")) {
       throw new Error("ERROR 1064 (42000): Syntax error in ALTER TABLE");
     }
-    const tableName = tokens[2].value;
-    const db = this.databases[this.activeDb];
+    let targetDbName = this.activeDb;
+    let tableName = tokens[2].value;
+    let idx = 3;
+    if (idx < tokens.length && tokens[idx].value === ".") {
+      idx++;
+      targetDbName = tableName;
+      tableName = tokens[idx++].value;
+    }
+    if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+    const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+    if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+    const db = this.databases[dbMatch];
     const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
-    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tableName}' doesn't exist`);
+    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tableName}' doesn't exist`);
     const table = db.tables[match];
 
-    let idx = 3;
     const action = tokUpper(tokens[idx++]);
 
     if (action === "ADD") {
@@ -721,14 +764,22 @@ class SQLEngine {
   }
 
   handleInsert(tokens) {
-    if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
     let idx = 1;
     if (tokIs(tokens[idx], "INTO")) idx++;
     if (!tokens[idx]) throw new Error("ERROR 1064 (42000): Missing table name in INSERT");
-    const tableName = tokens[idx++].value;
-    const db = this.databases[this.activeDb];
+    let targetDbName = this.activeDb;
+    let tableName = tokens[idx++].value;
+    if (idx < tokens.length && tokens[idx].value === ".") {
+      idx++;
+      targetDbName = tableName;
+      tableName = tokens[idx++].value;
+    }
+    if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+    const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+    if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+    const db = this.databases[dbMatch];
     const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
-    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tableName}' doesn't exist`);
+    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tableName}' doesn't exist`);
     const table = db.tables[match];
 
     let targetCols = null;
@@ -834,12 +885,20 @@ class SQLEngine {
   }
 
   handleUpdate(tokens) {
-    if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
     let idx = 1;
-    const tableName = tokens[idx++].value;
-    const db = this.databases[this.activeDb];
+    let targetDbName = this.activeDb;
+    let tableName = tokens[idx++].value;
+    if (idx < tokens.length && tokens[idx].value === ".") {
+      idx++;
+      targetDbName = tableName;
+      tableName = tokens[idx++].value;
+    }
+    if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+    const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+    if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+    const db = this.databases[dbMatch];
     const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
-    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tableName}' doesn't exist`);
+    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tableName}' doesn't exist`);
     const table = db.tables[match];
 
     if (!tokIs(tokens[idx], "SET")) {
@@ -899,13 +958,21 @@ class SQLEngine {
   }
 
   handleDelete(tokens) {
-    if (!this.activeDb) throw new Error("ERROR 1046 (3D000): No database selected");
     let idx = 1;
     if (tokIs(tokens[idx], "FROM")) idx++;
-    const tableName = tokens[idx++].value;
-    const db = this.databases[this.activeDb];
+    let targetDbName = this.activeDb;
+    let tableName = tokens[idx++].value;
+    if (idx < tokens.length && tokens[idx].value === ".") {
+      idx++;
+      targetDbName = tableName;
+      tableName = tokens[idx++].value;
+    }
+    if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+    const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+    if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+    const db = this.databases[dbMatch];
     const match = Object.keys(db.tables).find(t => t.toLowerCase() === tableName.toLowerCase());
-    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tableName}' doesn't exist`);
+    if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tableName}' doesn't exist`);
     const table = db.tables[match];
 
     let whereTokens = null;
@@ -1177,7 +1244,11 @@ class SQLEngine {
     }
 
     if (!alias) {
-      alias = formatTokensText(tokens);
+      if (tokens.length === 3 && tokens[0].value === "(" && tokens[2].value === ")") {
+        alias = tokens[1].value;
+      } else {
+        alias = formatTokensText(tokens);
+      }
     }
 
     return { alias, tokens: exprTokens };
@@ -1204,10 +1275,20 @@ class SQLEngine {
         if (tokIs(tokens[idx], "JOIN")) idx++;
       }
 
-      const tblName = tokens[idx++].value;
-      const match = Object.keys(db.tables).find(t => t.toLowerCase() === tblName.toLowerCase());
-      if (!match) throw new Error(`ERROR 1146 (42S02): Table '${this.activeDb}.${tblName}' doesn't exist`);
-      const table = db.tables[match];
+      let targetDbName = this.activeDb;
+      let tblName = tokens[idx++].value;
+      if (idx < tokens.length && tokens[idx].value === ".") {
+        idx++; // skip .
+        targetDbName = tblName;
+        tblName = tokens[idx++].value;
+      }
+      if (!targetDbName) throw new Error("ERROR 1046 (3D000): No database selected");
+      const dbMatch = Object.keys(this.databases).find(d => d.toLowerCase() === targetDbName.toLowerCase());
+      if (!dbMatch) throw new Error(`ERROR 1049 (42000): Unknown database '${targetDbName}'`);
+      const targetDbObj = this.databases[dbMatch];
+      const match = Object.keys(targetDbObj.tables).find(t => t.toLowerCase() === tblName.toLowerCase());
+      if (!match) throw new Error(`ERROR 1146 (42S02): Table '${dbMatch}.${tblName}' doesn't exist`);
+      const table = targetDbObj.tables[match];
 
       let alias = match;
       if (
@@ -1673,6 +1754,28 @@ class SQLEngine {
       return isNaN(d.getTime()) ? null : days[d.getDay()];
     }
 
+    // Information & System Functions
+    if (fn === "DATABASE" || fn === "SCHEMA") {
+      return this.activeDb || null;
+    }
+    if (fn === "VERSION") {
+      return "8.0.35";
+    }
+    if (fn === "USER" || fn === "CURRENT_USER") {
+      return "root@localhost";
+    }
+
+    // Null-handling Functions
+    if (fn === "IFNULL") {
+      return args[0] !== null && args[0] !== undefined ? args[0] : (args[1] !== undefined ? args[1] : null);
+    }
+    if (fn === "COALESCE") {
+      for (const a of args) {
+        if (a !== null && a !== undefined) return a;
+      }
+      return null;
+    }
+
     throw new Error(`ERROR 1305 (42000): FUNCTION ${name} does not exist`);
   }
 
@@ -2078,6 +2181,110 @@ function runTests() {
   console.log("=== Running Comprehensive SQL Engine Tests ===");
   const engine = new SQLEngine();
 
+  // 1. Run all 28 commands from CBSE Class XI SQL Practical Worksheet (Suncity School)
+  console.log("\n--- Testing Suncity School Class XI SQL Practical Worksheet ---");
+  const worksheetCommands = [
+    // 1. Create and select the database
+    "CREATE DATABASE school;",
+    "USE school;",
+    "SHOW DATABASES;",
+    "SELECT DATABASE();",
+    // 2. Create the student table
+    `CREATE TABLE student (
+ sid INT PRIMARY KEY,
+ class INT,
+ section CHAR(1),
+ gender VARCHAR(10),
+ name VARCHAR(30),
+ dob DATE,
+ marks INT
+);`,
+    "DESC student;",
+    // 3. Insert all 10 records
+    "INSERT INTO student VALUES (101, 11, 'A', 'Female', 'Aanya', '2009-01-15', 92);",
+    "INSERT INTO student VALUES (102, 11, 'A', 'Male', 'Aarav', '2008-07-20', 78);",
+    "INSERT INTO student VALUES (103, 11, 'B', 'Female', 'Diya', '2009-03-12', 45);",
+    "INSERT INTO student VALUES (104, 11, 'B', 'Male', 'Kabir', '2008-11-05', 88);",
+    "INSERT INTO student VALUES (105, 11, 'A', 'Female', 'Meera', '2009-08-22', 67);",
+    "INSERT INTO student VALUES (106, 11, 'B', 'Male', 'Arjun', '2008-04-18', 35);",
+    "INSERT INTO student VALUES (107, 11, 'A', 'Female', 'Riya', '2009-12-02', 96);",
+    "INSERT INTO student VALUES (108, 11, 'B', 'Male', 'Vivaan', '2008-09-09', 54);",
+    "INSERT INTO student VALUES (109, 11, 'A', 'Female', 'Anaya', '2009-05-25', 81);",
+    "INSERT INTO student VALUES (110, 11, 'B', 'Male', 'Reyansh', '2008-02-14', 60);",
+    "SELECT * FROM student;",
+    // 4. Display records and selected columns
+    "SELECT * FROM student;",
+    "SELECT sid, name, marks FROM student;",
+    "SELECT name, dob FROM student;",
+    "SELECT * FROM student ORDER BY sid DESC;",
+    // 5. Relational operators
+    "SELECT * FROM student WHERE marks > 80;",
+    "SELECT name, marks FROM student WHERE marks < 50;",
+    "SELECT * FROM student WHERE marks = 60;",
+    "SELECT name, marks FROM student WHERE marks >= 75;",
+    "SELECT * FROM student WHERE marks < 80;",
+    "SELECT * FROM student WHERE marks <= 60;",
+    "SELECT * FROM student WHERE marks <> 60;",
+    // 6. BETWEEN
+    "SELECT name, marks FROM student WHERE marks BETWEEN 50 AND 80;",
+    "SELECT sid, name, dob FROM student WHERE dob BETWEEN '2009-01-01' AND '2009-12-31';",
+    // 7. Logical operators
+    "SELECT name, section, marks FROM student WHERE section = 'A' AND marks > 80;",
+    "SELECT * FROM student WHERE section = 'A' OR marks > 90;",
+    "SELECT * FROM student WHERE NOT section = 'A';",
+    // 8. NULL values
+    "ALTER TABLE student ADD city VARCHAR(25);",
+    "SELECT name, city FROM student WHERE city IS NULL;",
+    "UPDATE student SET city = 'Gurugram' WHERE sid = 101;",
+    "SELECT name, city FROM student WHERE city IS NOT NULL;",
+    "UPDATE student SET city = 'Delhi' WHERE sid = 102;",
+    "SELECT * FROM student WHERE sid = 101;",
+    "SELECT * FROM student;",
+    // 9. UPDATE, DELETE, INSERT
+    "UPDATE student SET marks = 55 WHERE sid = 103;",
+    "UPDATE student SET section = 'A' WHERE sid = 108;",
+    "SELECT * FROM student WHERE sid = 103 OR sid = 108;",
+    "DELETE FROM student WHERE sid = 110;",
+    "SELECT * FROM student WHERE sid = 110;",
+    "INSERT INTO student VALUES (111, 11, 'B', 'Female', 'Tanya', '2009-06-10', 85, NULL);",
+    "SELECT * FROM student;",
+    // 10. ALTER TABLE
+    "ALTER TABLE student ADD email VARCHAR(50);",
+    "ALTER TABLE student MODIFY city VARCHAR(40);",
+    "DESC student;",
+    "SELECT * FROM student;",
+    // 11. DROP TABLE
+    `CREATE TABLE test_student (
+ sid INT,
+ name VARCHAR(30)
+);`,
+    "DESC test_student;",
+    "DROP TABLE test_student;",
+    "SHOW TABLES;",
+    // 12. Additional practice
+    "SHOW DATABASES;",
+    "USE school;",
+    "SELECT DATABASE();",
+    "SHOW TABLES;",
+    "DESC student;",
+    "SELECT * FROM student;",
+    "SELECT DISTINCT section FROM student;"
+  ];
+
+  let wsPassed = 0;
+  for (const cmd of worksheetCommands) {
+    const res = engine.execute(cmd);
+    for (const r of res) {
+      if (r.type === "ERROR") {
+        console.error("WORKSHEET ERROR: " + cmd + " => " + r.message);
+        failed++;
+      } else {
+        wsPassed++;
+      }
+    }
+  }
+  console.log(`Worksheet Commands: ${wsPassed} statements passed cleanly!\n`);
+
   const testQueries = [
     "SHOW DATABASES;",
     "USE school_db;",
@@ -2130,4 +2337,8 @@ function runTests() {
 
 if (typeof module !== "undefined") {
   module.exports = { SQLEngine, formatAsciiTable, formatVertical };
+}
+
+if (typeof require !== "undefined" && require.main === module) {
+  runTests();
 }
